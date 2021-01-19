@@ -211,7 +211,6 @@ source_set("scoped_spinlock") {
 
 source_set("ring_buffer") {
   deps = [
-    ":scoped_spinlock",
     "../../../gn:default_deps",
     "../../base",
   ]

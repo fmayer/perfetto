@@ -29,7 +29,6 @@
 #include "perfetto/base/build_config.h"
 #include "perfetto/ext/base/scoped_file.h"
 #include "perfetto/ext/base/temp_file.h"
-#include "src/profiling/memory/scoped_spinlock.h"
 
 #if PERFETTO_BUILDFLAG(PERFETTO_OS_ANDROID)
 #include <linux/memfd.h>
@@ -53,6 +52,16 @@ constexpr auto kFDSeals = F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL;
 
 
 SharedRingBuffer::SharedRingBuffer(CreateFlag, size_t size) {
+  // All the supported Android ABIs support lock-free uint64_t.
+  // For some reason, clang does not set ATOMIC_LONG_LOCK_FREE to 2 (always
+  // lock free) for the 32-bit x86 ABI, while generating lock-free assembly.
+  // This is why we resort to a runtime check here.
+  //
+  // Supported ABIs here: https://developer.android.com/ndk/guides/abis.
+  if (!std::atomic<uint64_t>{}.is_lock_free()) {
+    PERFETTO_ELOG("No lock-free uint64_t. Cannot used SharedRingBuffer.");
+    return;
+  }
   size_t size_with_meta = size + kMetaPageSize;
   base::ScopedFile fd;
 #if PERFETTO_BUILDFLAG(PERFETTO_OS_ANDROID)
@@ -182,52 +191,48 @@ void SharedRingBuffer::Initialize(base::ScopedFile mem_fd) {
 }
 
 SharedRingBuffer::Buffer SharedRingBuffer::BeginWrite(
-    const ScopedSpinlock& spinlock,
     size_t size) {
-  PERFETTO_DCHECK(spinlock.locked());
   Buffer result;
-
-  base::Optional<PointerPositions> opt_pos = GetPointerPositions();
-  if (!opt_pos) {
-    meta_->stats.num_writes_corrupt++;
-    errno = EBADF;
-    return result;
-  }
-  auto pos = opt_pos.value();
-
   const uint64_t size_with_header =
       base::AlignUp<kAlignment>(size + kHeaderSize);
 
   // size_with_header < size is for catching overflow of size_with_header.
   if (PERFETTO_UNLIKELY(size_with_header < size)) {
     errno = EINVAL;
-    return result;
+    return {};
   }
+  for (size_t i = 0; i < 1024; ++i) {
+    base::Optional<PointerPositions> opt_pos = GetPointerPositions();
+    if (!opt_pos) {
+      meta_->num_writes_corrupt.fetch_add(1, std::memory_order_relaxed);
+      errno = EBADF;
+      return {};
+    }
+    auto pos = opt_pos.value();
+    auto avail_write = write_avail(pos);
+    if (size_with_header > avail_write) {
+      meta_->num_writes_overflow.fetch_add(1, std::memory_order_relaxed);
+      errno = EAGAIN;
+      return {};
+    }
 
-  if (size_with_header > write_avail(pos)) {
-    meta_->stats.num_writes_overflow++;
-    errno = EAGAIN;
-    return result;
+    if (meta_->write_pos.compare_exchange_weak(pos.write_pos,
+                                               pos.write_pos + size_with_header,
+                                               std::memory_order_relaxed)) {
+      // This works because we memset to zero in EndWrite. This means that all
+      // unused memory - including at(pos.write_pos) - are zeroed. This means
+      // we do not have to set it to 0, and there is no race with the reader
+      // reading an incorrect value.
+      result.size = size;
+      result.data = at(pos.write_pos) + kHeaderSize;
+      result.bytes_free = avail_write;
+      meta_->bytes_written.fetch_add(size, std::memory_order_relaxed);
+      meta_->num_writes_succeeded.fetch_add(1, std::memory_order_relaxed);
+      return result;
+    }
   }
-
-  uint8_t* wr_ptr = at(pos.write_pos);
-
-  result.size = size;
-  result.data = wr_ptr + kHeaderSize;
-  result.bytes_free = write_avail(pos);
-  meta_->stats.bytes_written += size;
-  meta_->stats.num_writes_succeeded++;
-
-  // We can make this a relaxed store, as this gets picked up by the acquire
-  // load in GetPointerPositions (and the release store below).
-  reinterpret_cast<std::atomic<uint32_t>*>(wr_ptr)->store(
-      0, std::memory_order_relaxed);
-
-  // This needs to happen after the store above, so the reader never observes an
-  // incorrect byte count. This is matched by the acquire load in
-  // GetPointerPositions.
-  meta_->write_pos.fetch_add(size_with_header, std::memory_order_release);
-  return result;
+  errno = EAGAIN;
+  return {};
 }
 
 void SharedRingBuffer::EndWrite(Buffer buf) {
@@ -248,7 +253,7 @@ void SharedRingBuffer::EndWrite(Buffer buf) {
 SharedRingBuffer::Buffer SharedRingBuffer::BeginRead() {
   base::Optional<PointerPositions> opt_pos = GetPointerPositions();
   if (!opt_pos) {
-    meta_->stats.num_reads_corrupt++;
+    meta_->num_reads_corrupt.fetch_add(1, std::memory_order_relaxed);
     errno = EBADF;
     return Buffer();
   }
@@ -257,7 +262,7 @@ SharedRingBuffer::Buffer SharedRingBuffer::BeginRead() {
   size_t avail_read = read_avail(pos);
 
   if (avail_read < kHeaderSize) {
-    meta_->stats.num_reads_nodata++;
+    meta_->num_reads_nodata.fetch_add(1, std::memory_order_relaxed);
     errno = EAGAIN;
     return Buffer();  // No data
   }
@@ -267,7 +272,7 @@ SharedRingBuffer::Buffer SharedRingBuffer::BeginRead() {
   const size_t size = reinterpret_cast<std::atomic<uint32_t>*>(rd_ptr)->load(
       std::memory_order_acquire);
   if (size == 0) {
-    meta_->stats.num_reads_nodata++;
+    meta_->num_reads_nodata.fetch_add(1, std::memory_order_relaxed);
     errno = EAGAIN;
     return Buffer();
   }
@@ -278,7 +283,7 @@ SharedRingBuffer::Buffer SharedRingBuffer::BeginRead() {
         "Corrupted header detected, size=%zu"
         ", read_avail=%zu, rd=%" PRIu64 ", wr=%" PRIu64,
         size, avail_read, pos.read_pos, pos.write_pos);
-    meta_->stats.num_reads_corrupt++;
+    meta_->num_reads_corrupt.fetch_add(1, std::memory_order_relaxed);
     errno = EBADF;
     return Buffer();
   }
@@ -291,9 +296,12 @@ SharedRingBuffer::Buffer SharedRingBuffer::BeginRead() {
 void SharedRingBuffer::EndRead(Buffer buf) {
   if (!buf)
     return;
+  uint8_t* wr_ptr = buf.data - kHeaderSize;
   size_t size_with_header = base::AlignUp<kAlignment>(buf.size + kHeaderSize);
-  meta_->read_pos.fetch_add(size_with_header, std::memory_order_relaxed);
-  meta_->stats.num_reads_succeeded++;
+  memset(wr_ptr, 0, size_with_header);
+  // Matching acquire load in GetPointerPositions.
+  meta_->read_pos.fetch_add(size_with_header, std::memory_order_release);
+  meta_->num_reads_succeeded.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool SharedRingBuffer::IsCorrupt(const PointerPositions& pos) {

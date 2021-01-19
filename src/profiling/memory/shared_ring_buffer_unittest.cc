@@ -35,13 +35,7 @@ std::string ToString(const SharedRingBuffer::Buffer& buf_and_size) {
 }
 
 bool TryWrite(SharedRingBuffer* wr, const char* src, size_t size) {
-  SharedRingBuffer::Buffer buf;
-  {
-    auto lock = wr->AcquireLock(ScopedSpinlock::Mode::Try);
-    if (!lock.locked())
-      return false;
-    buf = wr->BeginWrite(lock, size);
-  }
+  SharedRingBuffer::Buffer buf = wr->BeginWrite(size);
   if (!buf)
     return false;
   memcpy(buf.data, src, size);
@@ -162,11 +156,7 @@ TEST(SharedRingBufferTest, WriteShutdown) {
   ASSERT_TRUE(rd);
   SharedRingBuffer wr =
       *SharedRingBuffer::Attach(base::ScopedFile(dup(rd->fd())));
-  SharedRingBuffer::Buffer buf;
-  {
-    auto lock = wr.AcquireLock(ScopedSpinlock::Mode::Blocking);
-    buf = wr.BeginWrite(lock, 10);
-  }
+  SharedRingBuffer::Buffer buf = wr.BeginWrite(10);
   rd = base::nullopt;
   memset(buf.data, 0, buf.size);
   wr.EndWrite(std::move(buf));
@@ -264,12 +254,7 @@ TEST(SharedRingBufferTest, EmptyWrite) {
   constexpr auto kBufSize = base::kPageSize * 4;
   base::Optional<SharedRingBuffer> wr = SharedRingBuffer::Create(kBufSize);
   ASSERT_TRUE(wr);
-  SharedRingBuffer::Buffer buf;
-  {
-    auto lock = wr->AcquireLock(ScopedSpinlock::Mode::Try);
-    ASSERT_TRUE(lock.locked());
-    buf = wr->BeginWrite(lock, 0);
-  }
+  SharedRingBuffer::Buffer buf = wr->BeginWrite(0);
   EXPECT_TRUE(buf);
   wr->EndWrite(std::move(buf));
 }

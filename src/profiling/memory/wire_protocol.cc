@@ -58,16 +58,7 @@ void UnsafeMemcpy(char* dest, const char* src, size_t n)
 
 template <typename F>
 int64_t WithBuffer(SharedRingBuffer* shmem, size_t total_size, F fn) {
-  SharedRingBuffer::Buffer buf;
-  {
-    ScopedSpinlock lock = shmem->AcquireLock(ScopedSpinlock::Mode::Try);
-    if (!lock.locked()) {
-      PERFETTO_DLOG("Failed to acquire spinlock.");
-      errno = EAGAIN;
-      return -1;
-    }
-    buf = shmem->BeginWrite(lock, total_size);
-  }
+  SharedRingBuffer::Buffer buf = shmem->BeginWrite(total_size);
   if (!buf) {
     PERFETTO_DLOG("Buffer overflow.");
     shmem->EndWrite(std::move(buf));

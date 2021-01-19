@@ -20,7 +20,6 @@
 #include "perfetto/ext/base/optional.h"
 #include "perfetto/ext/base/unix_socket.h"
 #include "perfetto/ext/base/utils.h"
-#include "src/profiling/memory/scoped_spinlock.h"
 
 #include <atomic>
 #include <map>
@@ -82,8 +81,6 @@ class SharedRingBuffer {
     uint64_t num_reads_corrupt;
     uint64_t num_reads_nodata;
 
-    // Fields below get set by GetStats as copies of atomics in MetadataPage.
-    uint64_t failed_spinlocks;
     uint64_t client_spinlock_blocked_us;
     bool hit_timeout;
   };
@@ -107,41 +104,45 @@ class SharedRingBuffer {
     return write_avail(*pos);
   }
 
-  Buffer BeginWrite(const ScopedSpinlock& spinlock, size_t size);
+  Buffer BeginWrite(size_t size);
   void EndWrite(Buffer buf);
 
   Buffer BeginRead();
   void EndRead(Buffer);
 
-  Stats GetStats(ScopedSpinlock& spinlock) {
-    PERFETTO_DCHECK(spinlock.locked());
-    Stats stats = meta_->stats;
-    stats.failed_spinlocks =
-        meta_->failed_spinlocks.load(std::memory_order_relaxed);
-    stats.hit_timeout = meta_->hit_timeout.load(std::memory_order_relaxed);
+  Stats GetStats() {
+    Stats stats;
+
+    stats.bytes_written = meta_->bytes_written.load(std::memory_order_relaxed);
+    stats.num_writes_succeeded =
+        meta_->num_writes_succeeded.load(std::memory_order_relaxed);
+    stats.num_writes_corrupt =
+        meta_->num_writes_corrupt.load(std::memory_order_relaxed);
+    stats.num_writes_overflow =
+        meta_->num_writes_overflow.load(std::memory_order_relaxed);
+
+    stats.num_reads_succeeded =
+        meta_->num_reads_succeeded.load(std::memory_order_relaxed);
+    stats.num_reads_corrupt =
+        meta_->num_reads_corrupt.load(std::memory_order_relaxed);
+    stats.num_reads_nodata =
+        meta_->num_reads_nodata.load(std::memory_order_relaxed);
+
     stats.client_spinlock_blocked_us =
         meta_->client_spinlock_blocked_us.load(std::memory_order_relaxed);
+    stats.hit_timeout = meta_->hit_timeout.load(std::memory_order_relaxed);
+
     return stats;
   }
 
   void SetHitTimeout() { meta_->hit_timeout.store(true); }
-
-  // This is used by the caller to be able to hold the SpinLock after
-  // BeginWrite has returned. This is so that additional bookkeeping can be
-  // done under the lock. This will be used to increment the sequence_number.
-  ScopedSpinlock AcquireLock(ScopedSpinlock::Mode mode) {
-    auto lock = ScopedSpinlock(&meta_->spinlock, mode);
-    if (PERFETTO_UNLIKELY(!lock.locked()))
-      meta_->failed_spinlocks.fetch_add(1, std::memory_order_relaxed);
-    return lock;
-  }
 
   void AddClientSpinlockBlockedUs(size_t n) {
     meta_->client_spinlock_blocked_us.fetch_add(n, std::memory_order_relaxed);
   }
 
   uint64_t client_spinlock_blocked_us() {
-    return meta_->client_spinlock_blocked_us;
+    return meta_->client_spinlock_blocked_us.load(std::memory_order_relaxed);
   }
 
   void SetShuttingDown() {
@@ -166,18 +167,21 @@ class SharedRingBuffer {
     std::atomic<uint64_t> read_pos;
     std::atomic<uint64_t> write_pos;
 
-    std::atomic<uint64_t> client_spinlock_blocked_us;
     std::atomic<uint64_t> failed_spinlocks;
-    alignas(uint64_t) std::atomic<bool> hit_timeout;
     alignas(uint64_t) std::atomic<bool> shutting_down;
     alignas(uint64_t) std::atomic<bool> reader_paused;
-    // For stats that are only accessed by a single thread or under the
-    // spinlock, members of this struct are directly modified. Other stats use
-    // the atomics above this struct.
-    //
-    // When the user requests stats, the atomics above get copied into this
-    // struct, which is then returned.
-    Stats stats;
+
+    std::atomic<uint64_t> bytes_written;
+    std::atomic<uint64_t> num_writes_succeeded;
+    std::atomic<uint64_t> num_writes_corrupt;
+    std::atomic<uint64_t> num_writes_overflow;
+
+    std::atomic<uint64_t> num_reads_succeeded;
+    std::atomic<uint64_t> num_reads_corrupt;
+    std::atomic<uint64_t> num_reads_nodata;
+
+    std::atomic<uint64_t> client_spinlock_blocked_us;
+    alignas(uint64_t) std::atomic<bool> hit_timeout;
   };
 
  private:
@@ -192,6 +196,11 @@ class SharedRingBuffer {
   SharedRingBuffer& operator=(const SharedRingBuffer&) = delete;
   SharedRingBuffer(CreateFlag, size_t size);
   SharedRingBuffer(AttachFlag, base::ScopedFile mem_fd) {
+    // See comment in CreateFlag constructor for details on this check.
+    if (!std::atomic<uint64_t>{}.is_lock_free()) {
+      PERFETTO_ELOG("No lock-free uint64_t. Cannot use SharedRingBuffer.");
+      return;
+    }
     Initialize(std::move(mem_fd));
   }
 
@@ -200,14 +209,15 @@ class SharedRingBuffer {
 
   inline base::Optional<PointerPositions> GetPointerPositions() {
     PointerPositions pos;
-    // We need to acquire load the write_pos to make sure we observe a
+    // We need to acquire load the read_pos to make sure we observe a
     // consistent ring buffer in BeginRead, otherwise it is possible that we
-    // observe the write_pos increment, but not the size field write of the
-    // payload.
+    // observe the read_pos increment, but the memset(0) in the previous
+    // EndWrite, thus reading a stale payload size.
     //
-    // This is matched by a release at the end of BeginWrite.
-    pos.write_pos = meta_->write_pos.load(std::memory_order_acquire);
-    pos.read_pos = meta_->read_pos.load(std::memory_order_relaxed);
+    // This is matched by a release at the end of EndRead.
+    pos.read_pos = meta_->read_pos.load(std::memory_order_acquire);
+    // Read the write pos afterwards to ensure write_pos >= read_pos.
+    pos.write_pos = meta_->write_pos.load(std::memory_order_relaxed);
 
     base::Optional<PointerPositions> result;
     if (IsCorrupt(pos))
