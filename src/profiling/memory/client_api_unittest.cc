@@ -53,8 +53,8 @@ void DisconnectGlobalServerSocket() {
 // circumstances (central heapprofd, fork heapprofd) and be agnostic about the
 // details. This is is used to create a test Client here.
 void StartHeapprofdIfStatic() {}
-std::shared_ptr<Client> ConstructClient(
-    UnhookedAllocator<perfetto::profiling::Client> unhooked_allocator) {
+
+bool ConstructClient(void* storage) {
   base::UnixSocketRaw cli_sock;
   base::UnixSocketRaw& srv_sock = GlobalServerSocket();
   std::tie(cli_sock, srv_sock) = base::UnixSocketRaw::CreatePairPosix(
@@ -64,9 +64,10 @@ std::shared_ptr<Client> ConstructClient(
   PERFETTO_CHECK(cli_sock);
   PERFETTO_CHECK(srv_sock);
   g_shmem_fd = ringbuf->fd();
-  return std::allocate_shared<Client>(unhooked_allocator, std::move(cli_sock),
-                                      g_client_config, std::move(*ringbuf),
-                                      getpid(), GetMainThreadStackRange());
+  new (storage)
+      Client(std::move(cli_sock), g_client_config, std::move(*ringbuf),
+             getpid(), GetMainThreadStackRange());
+  return true;
 }
 
 namespace {

@@ -17,8 +17,6 @@
 #ifndef SRC_PROFILING_MEMORY_CLIENT_API_FACTORY_H_
 #define SRC_PROFILING_MEMORY_CLIENT_API_FACTORY_H_
 
-#include <memory>
-
 #include "src/profiling/memory/unhooked_allocator.h"
 
 namespace perfetto {
@@ -28,8 +26,7 @@ class Client;
 
 void StartHeapprofdIfStatic();
 
-std::shared_ptr<Client> ConstructClient(
-    UnhookedAllocator<perfetto::profiling::Client> unhooked_allocator);
+bool ConstructClient(void* storage);
 
 }  // namespace profiling
 }  // namespace perfetto

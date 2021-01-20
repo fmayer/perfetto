@@ -42,8 +42,7 @@ namespace profiling {
 
 void StartHeapprofdIfStatic() {}
 
-std::shared_ptr<Client> ConstructClient(
-    UnhookedAllocator<perfetto::profiling::Client> unhooked_allocator) {
+bool ConstructClient(void* storage) {
   PERFETTO_LOG("Constructing client for central daemon.");
   using perfetto::profiling::Client;
 
@@ -52,10 +51,9 @@ std::shared_ptr<Client> ConstructClient(
   if (!sock) {
     PERFETTO_ELOG("Failed to connect to %s. This is benign on user builds.",
                   perfetto::profiling::kHeapprofdSocketFile);
-    return nullptr;
+    return false;
   }
-  return Client::CreateAndHandshake(std::move(sock.value()),
-                                    unhooked_allocator);
+  return Client::CreateAndHandshake(std::move(sock.value()), storage);
 }
 
 }  // namespace profiling

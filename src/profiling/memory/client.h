@@ -70,9 +70,7 @@ class Client {
   // Returns a shared_ptr since that is how the client will ultimately be used,
   // and to take advantage of std::allocate_shared putting the object & the
   // control block in one block of memory.
-  static std::shared_ptr<Client> CreateAndHandshake(
-      base::UnixSocketRaw sock,
-      UnhookedAllocator<Client> unhooked_allocator);
+  static bool CreateAndHandshake(base::UnixSocketRaw sock, void* storage);
 
   static base::Optional<base::UnixSocketRaw> ConnectToHeapprofd(
       const std::string& sock_name);

@@ -153,10 +153,9 @@ void StartHeapprofdIfStatic() {
 
 // This is called by AHeapProfile_initSession (client_api.cc) to construct a
 // client.
-std::shared_ptr<Client> ConstructClient(
-    UnhookedAllocator<perfetto::profiling::Client> unhooked_allocator) {
+bool ConstructClient(void* storage) {
   if (!g_client_sock)
-    return nullptr;
+    return false;
 
   std::shared_ptr<perfetto::profiling::Client> client;
   base::UnixSocketRaw srv_session_sock;
@@ -167,14 +166,14 @@ std::shared_ptr<Client> ConstructClient(
                                            base::SockType::kStream);
   if (!client_session_sock || !srv_session_sock) {
     PERFETTO_ELOG("Failed to create socket pair.");
-    return nullptr;
+    return false;
   }
   base::ScopedFile srv_fd = srv_session_sock.ReleaseFd();
   int fd = srv_fd.get();
   // Send the session socket to the service.
   g_client_sock->Send(" ", 1, &fd, 1);
   return perfetto::profiling::Client::CreateAndHandshake(
-      std::move(client_session_sock), unhooked_allocator);
+      std::move(client_session_sock), storage);
 }
 
 }  // namespace profiling

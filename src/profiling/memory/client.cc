@@ -158,12 +158,10 @@ base::Optional<base::UnixSocketRaw> Client::ConnectToHeapprofd(
 }
 
 // static
-std::shared_ptr<Client> Client::CreateAndHandshake(
-    base::UnixSocketRaw sock,
-    UnhookedAllocator<Client> unhooked_allocator) {
+bool Client::CreateAndHandshake(base::UnixSocketRaw sock, void* storage) {
   if (!sock) {
     PERFETTO_DFATAL_OR_ELOG("Socket not connected.");
-    return nullptr;
+    return false;
   }
 
   sock.DcheckIsBlocking(true);
@@ -187,12 +185,12 @@ std::shared_ptr<Client> Client::CreateAndHandshake(
   base::ScopedFile maps(base::OpenFile("/proc/self/maps", O_RDONLY));
   if (!maps) {
     PERFETTO_DFATAL_OR_ELOG("Failed to open /proc/self/maps");
-    return nullptr;
+    return false;
   }
   base::ScopedFile mem(base::OpenFile("/proc/self/mem", O_RDONLY));
   if (!mem) {
     PERFETTO_DFATAL_OR_ELOG("Failed to open /proc/self/mem");
-    return nullptr;
+    return false;
   }
 
   // Restore original dumpability value if we overrode it.
@@ -207,7 +205,7 @@ std::shared_ptr<Client> Client::CreateAndHandshake(
   if (sock.Send(kSingleByte, sizeof(kSingleByte), fds, num_send_fds) !=
       sizeof(kSingleByte)) {
     PERFETTO_DFATAL_OR_ELOG("Failed to send file descriptors.");
-    return nullptr;
+    return false;
   }
 
   ClientConfiguration client_config;
@@ -224,31 +222,31 @@ std::shared_ptr<Client> Client::CreateAndHandshake(
                               sizeof(client_config) - recv, fd, num_fds);
     if (rd == -1) {
       PERFETTO_PLOG("Failed to receive ClientConfiguration.");
-      return nullptr;
+      return false;
     }
     if (rd == 0) {
       PERFETTO_LOG("Server disconnected while sending ClientConfiguration.");
-      return nullptr;
+      return false;
     }
     recv += static_cast<size_t>(rd);
   }
 
   if (!shmem_fd) {
     PERFETTO_DFATAL_OR_ELOG("Did not receive shmem fd.");
-    return nullptr;
+    return false;
   }
 
   auto shmem = SharedRingBuffer::Attach(std::move(shmem_fd));
   if (!shmem || !shmem->is_valid()) {
     PERFETTO_DFATAL_OR_ELOG("Failed to attach to shmem.");
-    return nullptr;
+    return false;
   }
 
   sock.SetBlocking(false);
   // note: the shared_ptr will retain a copy of the unhooked_allocator
-  return std::allocate_shared<Client>(unhooked_allocator, std::move(sock),
-                                      client_config, std::move(shmem.value()),
-                                      getpid(), GetMainThreadStackRange());
+  new (storage) Client(std::move(sock), client_config, std::move(shmem.value()),
+                       getpid(), GetMainThreadStackRange());
+  return true;
 }
 
 Client::Client(base::UnixSocketRaw sock,
